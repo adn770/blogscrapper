@@ -1,0 +1,9 @@
+# Data
+cache
+md
+
+# Other
+__pycache__/
+.doit.*
+.DS_Store
+
