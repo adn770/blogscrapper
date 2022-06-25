@@ -28,9 +28,17 @@ blogscrapper
 
 
 Usage:
-    blogscrapper [options] URL
+    blogscrapper [options] scrap <URL>
+    blogscrapper [options] mdfy [CACHEDDIR]
+    blogscrapper [options] clean [CACHEDDIR]
+
+Commands:
+    scrap                 Download content from specified <URL>
+    mdfy                  Convert to markdown
+    clean                 Clean html on the cached data
 
 Options:
+    -f --force            Force the operation
     -h --help             Show this message
     --version             Show version
     --log-level=LEVEL     Level of logging to produce [default: INFO]
@@ -48,28 +56,70 @@ import requests
 import mdformat
 
 from enum import Enum
+from glob import glob
 from pathlib import Path
-from random import randrange
 from docopt import docopt
+from random import randrange
 from bs4 import BeautifulSoup
 from markdownify import MarkdownConverter
 
 
 # Create shorthand method for conversion
-def md(soup, **options):
-    return MarkdownConverter(**options).convert_soup(soup)
+def md(content, **options):
+    return MarkdownConverter(**options).convert_soup(content)
+
+def clean_html(content):
+    for to_remove in content.find_all("div", class_="sharedaddy"):
+        to_remove.decompose()
+    for to_remove in content.find_all("div", class_="entry-meta"):
+        to_remove.decompose()
+    for to_remove in content.find_all("div", id="comments"):
+        to_remove.decompose()
+    for to_remove in content.find_all("script"):
+        to_remove.decompose()
+    for to_remove in content.find_all("small"):
+        to_remove.decompose()
+    for to_remove in content.find_all("footer"):
+        to_remove.decompose()
+    return content
+
+def mdfy(filename="unknown", force = False):
+    ofilename = str(filename).replace("cache", "md").replace(".html", ".md")
+    if not force and Path(ofilename).is_file():
+        return
+
+    with open(filename, "r") as fhandle:
+        content = BeautifulSoup(fhandle, features="html.parser")
+        if force:
+            content = clean_html(content)
+        with open(ofilename, "w") as fhandle:
+            content = md(content, heading_style="ATX")
+            content = mdformat.text(content, options={"number": True, "wrap": 70})
+            fhandle.write(content)
+
+def do_mdfy(cached_files, force=False):
+    logging.info("+--.-- search pattern: %s", cached_files)
+    for filename in sorted(glob(cached_files)):
+        logging.info("   :···> mdfy: %s", filename)
+        mdfy(filename, force)
 
 
-class Mode(Enum):
-    UNKNOWN = 0
-    BLOGSPOT = 1
-    WORDPRESS = 2
-
+def do_clean(cached_files, force=False):
+    logging.info("+--.--[ search pattern: %s ]", cached_files)
+    for filename in sorted(glob(cached_files)):
+        logging.info("   :···> clean: %s", filename)
+        content = None
+        with open(filename, "r") as fhandle:
+            content = BeautifulSoup(fhandle, features="html.parser")
+        if content:
+            content = clean_html(content)
+            with open(filename, "w") as fhandle:
+                fhandle.write(content.prettify(formatter='html'))
 
 def has_id_as_meta(id, content):
     for meta in content.find_all("meta"):
         logging.debug("meta: %s", meta)
-        if meta.has_key('content') and meta['content'] == id:
+        if meta.has_key('content') and id in meta['content'].lower():
             return True
     return False
 
@@ -80,10 +130,21 @@ def is_blogspot(content):
     return False
 
 def is_wordpress(content):
+    if has_id_as_meta('wordpress', content):
+        return True
     for link in content.find_all("a"):
-        if "wordpress" in link['href']:
+        if link.has_key('href') and "wordpress" in link['href']:
             return True
+    if content.find_all("article"):
+        return True
+
     return False
+
+
+class Mode(Enum):
+    UNKNOWN = 0
+    BLOGSPOT = 1
+    WORDPRESS = 2
 
 
 class Scrapper():
@@ -106,7 +167,43 @@ class Scrapper():
         self.mdpath = Path("md", self.rootname)
         self.basepath.mkdir(parents=True, exist_ok=True)
         self.mdpath.mkdir(parents=True, exist_ok=True)
-        self.scrap()
+
+
+    def scrap(self, force=False):
+        url = self.url
+
+        while url:
+            logging.debug("* Scrapping at url: %s", url)
+            response = requests.get(url)
+            content = BeautifulSoup(response.content, features="html.parser")
+            self.autoconfigure(content)
+            for article in self.articles(content):
+                self.scrap_page(article, force)
+            url = self.extract_next_url(content)
+
+    def extract_next_url(self, content):
+        url = None
+        link = None
+        if self.mode == Mode.BLOGSPOT:
+            link = content.find("a", "blog-pager-older-link")
+        elif self.mode == Mode.WORDPRESS:
+            div = content.find("div", ["content-nav", "nav-previous", "navigation"])
+            if div:
+                link = div.find("a")
+            if not link:
+                link = content.find("a", class_="next")
+            if not link:
+                link = content.find("a", class_="page-numbers")
+            if not link:
+                link = content.find("a", class_="pagination__item--next")
+
+        if link:
+            url = link['href']
+        else:
+            logging.debug("next url not found, content:\n%s", content.prettify())
+
+        time.sleep(self.pausedtime + randrange(3))
+        return url
 
     def autoconfigure(self, content):
         if self.mode == Mode.UNKNOWN:
@@ -129,61 +226,17 @@ class Scrapper():
                 articles = content.find_all("div", ["post", "type-post", "item entry"])
         return articles
 
-    def scrap(self):
-        url = self.url
-
-        while url:
-            logging.debug("* Scrapping at url: %s", url)
-            response = requests.get(url)
-            content = BeautifulSoup(response.content, features="html.parser")
-            self.autoconfigure(content)
-            for article in self.articles(content):
-                self.scrap_page(article)
-            url = self.extract_next_url(content)
-
-    def extract_next_url(self, content):
-        url = None
-        link = None
-        if self.mode == Mode.BLOGSPOT:
-            link = content.find("a", "blog-pager-older-link")
-        elif self.mode == Mode.WORDPRESS:
-            div = content.find("div", "nav-previous")
-            if not div:
-                div = content.find("div", "navigation")
-            if div:
-                link = div.find("a")
-            if not link:
-                link = content.find("a", class_="next page-numbers")
-
-        if link:
-            url = link['href']
-        else:
-            logging.debug("next url not found, content:\n%s", content.prettify())
-
-        time.sleep(self.pausedtime + randrange(3))
-        return url
 
     def saveat(self, filename="unknown"):
         self.counter = self.counter + 1
         return Path(self.basepath, filename)
 
-    def markdownify(self, filename="unknown"):
-        ofilename = str(filename).replace("cache", "md").replace(".html", ".md")
-        if Path(ofilename).is_file():
-            return
-
-        with open(filename, "r") as fhandle:
-            content = BeautifulSoup(fhandle, features="html.parser")
-            with open(ofilename, "w") as fhandle:
-                content = md(content, heading_style="ATX")
-                content = mdformat.text(content,  options={"number": True, "wrap": 70})
-                fhandle.write(content)
-
-
     def extract_post(self, content):
         post = None
         if self.mode == Mode.BLOGSPOT:
             post = content.find("div", class_="post-body entry-content")
+            if not post:
+                post = content.find("div", class_="post")
         elif self.mode == Mode.WORDPRESS:
             post = content.find("div", class_="post-entry")
             if not post:
@@ -194,24 +247,11 @@ class Scrapper():
                 post = content.find("div", class_="content-area")
             if not post:
                 post = content.find("div", class_="storycontent")
-            if post:
-                for to_remove in post.find_all("div", class_="sharedaddy"):
-                    to_remove.decompose()
-                for to_remove in post.find_all("div", class_="entry-meta"):
-                    to_remove.decompose()
-                for to_remove in post.find_all("div", id="comments"):
-                    to_remove.decompose()
-                for to_remove in post.find_all("script"):
-                    to_remove.decompose()
-                for to_remove in post.find_all("small"):
-                    to_remove.decompose()
-                for to_remove in post.find_all("footer"):
-                    to_remove.decompose()
-        if not post:
-            logging.warning("post not found, content:\n%s", content.prettify())
+        #if not post:
+        #    logging.warning("post not found, content:\n%s", content.prettify())
         return post
 
-    def scrap_page(self, content):
+    def scrap_page(self, content, force=False):
         link = content.find("a")
         if not link:
             logging.warning("link not found, content:\n%s", content.prettify())
@@ -235,30 +275,32 @@ class Scrapper():
         logging.debug("saveat: %s", saveat)
         logging.info("+--| %04d |_.·-[ %s ]", self.counter, title.strip())
 
-        if not saveat.is_file():
-            response = requests.get(url)
-            content = BeautifulSoup(response.content, features="html.parser")
-            post = self.extract_post(content)
-            if post:
-                logging.info("   `------´ \.--<: %s", url)
-                logging.info("   .------.  `------:> Saving: %s", saveat)
-                opost = BeautifulSoup(self.HTML, features="html.parser")
-                title_tag = content.new_tag("title")
-                title_tag.string = title
-                opost.head.append(title_tag)
-                opost.html.body.append(post)
-                self.save(opost, saveat)
-            else:
-                logging.info("   `------´ \.--<: %s", url)
-                logging.info("             `------[ Post not found ]")
-                # logging.warning("Post not found, content:\n%s", content.prettify())
-                logging.info("   .------.")
-                return
-        else:
+        if not force and saveat.is_file():
             logging.info("   `------´ `--<: %s", url)
             logging.info("   .------.")
+            return
 
-        self.markdownify(saveat)
+        response = requests.get(url)
+        content = BeautifulSoup(response.content, features="html.parser")
+        post = self.extract_post(content)
+        if post:
+            logging.info("   `------´ \.--<: %s", url)
+            logging.info("   .------.  `------:> Saving: %s", saveat)
+            opost = BeautifulSoup(self.HTML, features="html.parser")
+            opost = clean_html(opost)
+            title_tag = content.new_tag("title")
+            title_tag.string = title
+            opost.head.append(title_tag)
+            opost.html.body.append(post)
+            self.save(opost, saveat)
+        else:
+            logging.info("   `------´ \.--<: %s", url)
+            logging.info("             `------[ Post not found ]")
+            # logging.warning("Post not found, content:\n%s", content.prettify())
+            logging.info("   .------.")
+            return
+
+        mdfy(saveat)
 
     def save(self, content, saveat="unknown"):
         with open(saveat, "w") as fhandle:
@@ -285,7 +327,16 @@ def main():
                       'Version 3.6 or higher.')
         sys.exit(1)
 
-    Scrapper(args.pop('URL'))
+    force = args.pop('--force')
+    cacheddir = args.pop('CACHEDDIR') or "*"
+    cached_files = f"cache/{cacheddir}/*.html"
+    if args.pop('scrap'):
+        scrapper = Scrapper(args.pop('<URL>'))
+        scrapper.scrap(force)
+    elif args.pop('mdfy'):
+        do_mdfy(cached_files, force)
+    elif args.pop('clean'):
+        do_clean(cached_files, force)
 
 
 if __name__ == '__main__':
