@@ -161,13 +161,12 @@ class Scrapper():
         self.counter = 0
         self.mode = Mode.UNKNOWN
         self.pausedtime = pausedtime
-        self.url = url
+        self.url = url.rstrip("/")
         self.rootname = url.rsplit('/', 1)[-1]
         self.basepath = Path("cache", self.rootname)
         self.mdpath = Path("md", self.rootname)
         self.basepath.mkdir(parents=True, exist_ok=True)
         self.mdpath.mkdir(parents=True, exist_ok=True)
-
 
     def scrap(self, force=False):
         url = self.url
