@@ -29,11 +29,13 @@ blogscrapper
 
 Usage:
     blogscrapper [options] scrap <URL>
+    blogscrapper [options] refresh [STARTAT]
     blogscrapper [options] mdfy [CACHEDDIR]
     blogscrapper [options] clean [CACHEDDIR]
 
 Commands:
     scrap                 Download content from specified <URL>
+    refresh               Refresh cached sites
     mdfy                  Convert to markdown
     clean                 Clean html on the cached data
 
@@ -49,6 +51,7 @@ Log levels:  DEBUG INFO WARNING ERROR CRITICAL
 
 """
 
+import re
 import sys
 import time
 import logging
@@ -61,8 +64,26 @@ from pathlib import Path
 from docopt import docopt
 from random import randrange
 from bs4 import BeautifulSoup
+from urllib.parse import urlparse
 from markdownify import MarkdownConverter
 
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.12; rv:55.0) Gecko/20100101 Firefox/55.0',
+}
+
+def load_cached_urls():
+    filename = Path(".urls")
+    urls = []
+    if filename.is_file():
+        with open(filename, "r") as fhandle:
+            urls = fhandle.readlines()
+    return [url.strip() for url in urls]
+
+def save_cached_urls(urls):
+    filename = Path(".urls")
+    urls = [f"{url}\n" for url in  sorted(urls)]
+    with open(filename, "w") as fhandle:
+        fhandle.writelines(urls)
 
 # Create shorthand method for conversion
 def md(content, **options):
@@ -103,7 +124,6 @@ def do_mdfy(cached_files, force=False):
         logging.info("   :···> mdfy: %s", filename)
         mdfy(filename, force)
 
-
 def do_clean(cached_files, force=False):
     logging.info("+--.--[ search pattern: %s ]", cached_files)
     for filename in sorted(glob(cached_files)):
@@ -115,6 +135,14 @@ def do_clean(cached_files, force=False):
             content = clean_html(content)
             with open(filename, "w") as fhandle:
                 fhandle.write(content.prettify(formatter='html'))
+
+def do_refresh(urls, force=False, startat=None):
+    logging.info("+ refresh")
+    if startat:
+        urls = [url for url in urls if url>=startat]
+    for url in urls:
+        scrapper = Scrapper(url)
+        scrapper.scrap(force, only_first_page=False)
 
 def has_id_as_meta(id, content):
     for meta in content.find_all("meta"):
@@ -140,6 +168,10 @@ def is_wordpress(content):
 
     return False
 
+def title_to_filename(s):
+    s = str(s).strip().replace(' ', '_')
+    return re.sub(r'(?u)[^-\w.]', '', s)
+
 
 class Mode(Enum):
     UNKNOWN = 0
@@ -158,27 +190,35 @@ class Scrapper():
            """
 
     def __init__(self, url = '', pausedtime = 1):
+        self.nav = None
         self.counter = 0
         self.mode = Mode.UNKNOWN
         self.pausedtime = pausedtime
-        self.url = url.rstrip("/")
-        self.rootname = url.rsplit('/', 1)[-1]
+        self.url = url
+        self.rootname = urlparse(url).hostname
         self.basepath = Path("cache", self.rootname)
         self.mdpath = Path("md", self.rootname)
         self.basepath.mkdir(parents=True, exist_ok=True)
         self.mdpath.mkdir(parents=True, exist_ok=True)
+        self.visited = set()
 
-    def scrap(self, force=False):
+    def scrap(self, force=False, only_first_page=False):
         url = self.url
 
         while url:
-            logging.debug("* Scrapping at url: %s", url)
-            response = requests.get(url)
+            if url in self.visited:
+                break
+            self.visited.add(url)
+            response = requests.get(url, headers=HEADERS)
+            logging.info("* Scrapping at url: [%s] --> Status: %d", url, response.status_code)
             content = BeautifulSoup(response.content, features="html.parser")
             self.autoconfigure(content)
-            for article in self.articles(content):
+            for article in self.list_articles(content):
                 self.scrap_page(article, force)
-            url = self.extract_next_url(content)
+            if only_first_page:
+                url = None
+            else:
+                url = self.extract_next_url(content)
 
     def extract_next_url(self, content):
         url = None
@@ -186,9 +226,19 @@ class Scrapper():
         if self.mode == Mode.BLOGSPOT:
             link = content.find("a", "blog-pager-older-link")
         elif self.mode == Mode.WORDPRESS:
-            div = content.find("div", ["content-nav", "nav-previous", "navigation"])
-            if div:
-                link = div.find("a")
+            for key in ["fright", "archive-navigation",
+                        "content-nav", "nav-previous", "navigation"]:
+                div = content.find("div", class_=key)
+                if div:
+                    if not self.nav:
+                        link = div.find("a")
+                    else:
+                        for link in div.find_all("a"):
+                            if self.nav in link.text:
+                                break
+                if link:
+                    break
+
             if not link:
                 link = content.find("a", class_="next")
             if not link:
@@ -197,11 +247,13 @@ class Scrapper():
                 link = content.find("a", class_="pagination__item--next")
 
         if link:
+            if not self.nav:
+                self.nav = link.text.strip()
             url = link['href']
+            if url.startswith("/"):
+                url = self.url + url
         else:
             logging.debug("next url not found, content:\n%s", content.prettify())
-
-        time.sleep(self.pausedtime + randrange(3))
         return url
 
     def autoconfigure(self, content):
@@ -213,18 +265,30 @@ class Scrapper():
             elif "wordpress" in self.url or is_wordpress(content):
                 self.mode = Mode.WORDPRESS
                 logging.info("* Mode: wordpress")
-            logging.info("   .------.")
 
-    def articles(self, content):
+    def list_articles(self, content):
+        def article_filtered(article):
+            link=article.find('a')
+            if link:
+                return link['href'].startswith(("http://feeds.feedburner.com",
+                                                "http://audio/"))
+            return True
+
         articles = []
         if self.mode == Mode.BLOGSPOT:
-            articles = content.find_all("h3", ["post-title", "entry-title"])
+            articles = content.find_all("div", ["post-title", "entry-title"])
+            if not articles:
+                articles = content.find_all("h1", ["post-title", "entry-title"])
+            if not articles:
+                articles = content.find_all("h2", ["post-title", "entry-title"])
+            if not articles:
+                articles = content.find_all("h3", ["post-title", "entry-title"])
         elif self.mode == Mode.WORDPRESS:
             articles = content.find_all("article")
             if not articles:
                 articles = content.find_all("div", ["post", "type-post", "item entry"])
+        articles = [article for article in articles if not article_filtered(article)]
         return articles
-
 
     def saveat(self, filename="unknown"):
         self.counter = self.counter + 1
@@ -237,34 +301,45 @@ class Scrapper():
             if not post:
                 post = content.find("div", class_="post")
         elif self.mode == Mode.WORDPRESS:
-            post = content.find("div", class_="post-entry")
+            post = content.find("article")
             if not post:
-                post = content.find("div", class_="content")
+                post = content.find("div", class_="entry")
+            if not post:
+                post = content.find("div", class_="post-entry")
             if not post:
                 post = content.find("div", class_="entry-content")
+            if not post:
+                post = content.find("div", class_="content")
             if not post:
                 post = content.find("div", class_="content-area")
             if not post:
                 post = content.find("div", class_="storycontent")
-        #if not post:
-        #    logging.warning("post not found, content:\n%s", content.prettify())
+        if not post:
+            logging.debug("post not found, content:\n%s", content.prettify())
         return post
 
     def scrap_page(self, content, force=False):
+        if self.mode == Mode.WORDPRESS:
+            entry = content.find('h1', class_='entry-title')
+            entry = entry or content.find('h2', class_='entry-title')
+            if entry:
+                content = entry
         link = content.find("a")
         if not link:
             logging.warning("link not found, content:\n%s", content.prettify())
             return
+        url = link['href'].rstrip("/")
+        if url.startswith("/"):
+            url = self.url + url
 
-        url = link['href']
-        if url[-1]  == "/":
-            url = url[:-1]
         if link.has_key('title'):
             title = link['title']
         else:
             title = link.text
 
         filename = url.split("/", 3)[-1].replace("/", "-")
+        if filename.startswith("?"):
+            filename = title_to_filename(title)
         if not filename[-5:] == ".html":
             filename = filename + ".html"
 
@@ -272,19 +347,19 @@ class Scrapper():
 
         logging.debug("filename: %s", filename)
         logging.debug("saveat: %s", saveat)
+        logging.info("   .------.")
         logging.info("+--| %04d |_.·-[ %s ]", self.counter, title.strip())
 
         if not force and saveat.is_file():
             logging.info("   `------´ `--<: %s", url)
-            logging.info("   .------.")
             return
 
-        response = requests.get(url)
+        response = requests.get(url, headers=HEADERS)
         content = BeautifulSoup(response.content, features="html.parser")
         post = self.extract_post(content)
         if post:
             logging.info("   `------´ \.--<: %s", url)
-            logging.info("   .------.  `------:> Saving: %s", saveat)
+            logging.info("             `------:> Saving: %s", saveat)
             opost = BeautifulSoup(self.HTML, features="html.parser")
             opost = clean_html(opost)
             title_tag = content.new_tag("title")
@@ -295,8 +370,7 @@ class Scrapper():
         else:
             logging.info("   `------´ \.--<: %s", url)
             logging.info("             `------[ Post not found ]")
-            # logging.warning("Post not found, content:\n%s", content.prettify())
-            logging.info("   .------.")
+            logging.debug("Post not found, content:\n%s", content.prettify())
             return
 
         mdfy(saveat)
@@ -319,6 +393,9 @@ def main():
     logging.basicConfig(filename=args.pop('--log-file'), filemode='w',
                         level=loglevel, format='%(levelname)s: %(message)s')
 
+    logging.getLogger("requests").setLevel(logging.WARNING)
+    logging.getLogger("bs4").setLevel(logging.WARNING)
+
     # Check python version
     is_min_python_3_6 = sys.version_info[0] == 3 and sys.version_info[1] >= 6
     if not is_min_python_3_6:
@@ -329,14 +406,20 @@ def main():
     force = args.pop('--force')
     cacheddir = args.pop('CACHEDDIR') or "*"
     cached_files = f"cache/{cacheddir}/*.html"
+    urls = load_cached_urls()
     if args.pop('scrap'):
-        scrapper = Scrapper(args.pop('<URL>'))
+        url = args.pop('<URL>').rstrip("/")
+        if not url in urls:
+            urls.append(url)
+        scrapper = Scrapper(url)
         scrapper.scrap(force)
+    elif args.pop('refresh'):
+        do_refresh(urls, force, args.pop('STARTAT'))
     elif args.pop('mdfy'):
         do_mdfy(cached_files, force)
     elif args.pop('clean'):
         do_clean(cached_files, force)
-
+    save_cached_urls(urls)
 
 if __name__ == '__main__':
     main()
