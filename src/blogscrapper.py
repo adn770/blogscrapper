@@ -68,7 +68,7 @@ from urllib.parse import urlparse
 from markdownify import MarkdownConverter
 
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.12; rv:55.0) Gecko/20100101 Firefox/55.0',
+    'User-Agent': 'Mozilla/6.0 (Macintosh; Intel Mac OS X 12_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36',
 }
 
 def load_cached_urls():
@@ -115,7 +115,7 @@ def mdfy(filename="unknown", force = False):
             content = clean_html(content)
         with open(ofilename, "w") as fhandle:
             content = md(content, heading_style="ATX")
-            content = mdformat.text(content, options={"number": True, "wrap": 70})
+            content = mdformat.text(content, options={"number": True})
             fhandle.write(content)
 
 def do_mdfy(cached_files, force=False):
@@ -216,7 +216,7 @@ class Scrapper():
             for article in self.list_articles(content):
                 self.scrap_page(article, force)
             if only_first_page:
-                url = None
+                return
             else:
                 url = self.extract_next_url(content)
 
@@ -226,7 +226,7 @@ class Scrapper():
         if self.mode == Mode.BLOGSPOT:
             link = content.find("a", "blog-pager-older-link")
         elif self.mode == Mode.WORDPRESS:
-            for key in ["fright", "archive-navigation",
+            for key in ["fright", "archive-navigation", "navbar",
                         "content-nav", "nav-previous", "navigation"]:
                 div = content.find("div", class_=key)
                 if div:
@@ -269,9 +269,10 @@ class Scrapper():
     def list_articles(self, content):
         def article_filtered(article):
             link=article.find('a')
-            if link:
+            if link and link.has_key('href'):
                 return link['href'].startswith(("http://feeds.feedburner.com",
-                                                "http://audio/"))
+                                                "http://audio/",
+                                                "http://webpages.charter.net"))
             return True
 
         articles = []
@@ -286,7 +287,7 @@ class Scrapper():
         elif self.mode == Mode.WORDPRESS:
             articles = content.find_all("article")
             if not articles:
-                articles = content.find_all("div", ["post", "type-post", "item entry"])
+                articles = content.find_all("div", ["post", "type-post", "item entry", "blog-post-homepage-link-hashtag-hover-color"])
         articles = [article for article in articles if not article_filtered(article)]
         return articles
 
@@ -303,6 +304,8 @@ class Scrapper():
         elif self.mode == Mode.WORDPRESS:
             post = content.find("article")
             if not post:
+                post = content.find("div", class_="post")
+            if not post:
                 post = content.find("div", class_="entry")
             if not post:
                 post = content.find("div", class_="post-entry")
@@ -315,7 +318,7 @@ class Scrapper():
             if not post:
                 post = content.find("div", class_="storycontent")
         if not post:
-            logging.debug("post not found, content:\n%s", content.prettify())
+            logging.info("post not found, content:\n%s", content.prettify())
         return post
 
     def scrap_page(self, content, force=False):
@@ -411,6 +414,7 @@ def main():
         url = args.pop('<URL>').rstrip("/")
         if not url in urls:
             urls.append(url)
+            save_cached_urls(urls)
         scrapper = Scrapper(url)
         scrapper.scrap(force)
     elif args.pop('refresh'):
